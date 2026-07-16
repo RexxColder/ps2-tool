@@ -151,62 +151,87 @@ static int cmd_analyze(int argc, char** argv) {
 }
 
 static int cmd_match_sce(int argc, char** argv) {
-    if (argc < 5) {
-        std::cerr << "Usage: ps2-tool match-sce <game.elf> <sce_db.json> <analysis.db>\n";
-        std::cerr << "  Reads ELF + analysis DB, matches functions against SCE database,\n";
-        std::cerr << "  updates DB with SDK categories and library names.\n";
+    if (argc < 4) {
+        std::cerr << "Usage: ps2-tool match-sce <game.elf> <functions.csv> [sce_db] [config.toml]\n";
+        std::cerr << "  Matches SDK functions using:\n";
+        std::cerr << "  1. SHA-1 exact match against SCE database\n";
+        std::cerr << "  2. SDK address lookup from config.toml\n";
+        std::cerr << "  3. Instruction pattern matching (jump stubs)\n";
         return 1;
     }
     std::string elf_path = argv[2];
-    std::string sce_db_path = argv[3];
-    std::string analysis_db = argv[4];
+    std::string csv_path = argv[3];
+    std::string sce_path = (argc > 4) ? argv[4] : "";
+    std::string config_path = (argc > 5) ? argv[5] : "";
 
-    std::cout << "Loading SCE database: " << sce_db_path << "\n";
-    auto sce_db = load_sce_database(sce_db_path);
-    std::cout << "  " << sce_db.size() << " SHA-1 signatures loaded\n";
-
-    // Read functions from analysis DB
+    // Read functions from CSV
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> functions;
     {
-        sqlite3* db = nullptr;
-        if (sqlite3_open(analysis_db.c_str(), &db) != SQLITE_OK) {
-            std::cerr << "Cannot open DB: " << analysis_db << "\n";
-            return 1;
-        }
-        sqlite3_stmt* stmt = nullptr;
-        std::string q = "SELECT address, size FROM functions ORDER BY address";
-        if (sqlite3_prepare_v2(db, q.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                uint64_t addr = sqlite3_column_int64(stmt, 0);
-                uint64_t size = sqlite3_column_int64(stmt, 1);
+        std::ifstream csv(csv_path);
+        if (!csv) { std::cerr << "Cannot open: " << csv_path << "\n"; return 1; }
+        std::string header;
+        std::getline(csv, header);
+        std::string line;
+        int line_count = 0;
+        while (std::getline(csv, line)) {
+            line_count++;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            // CSV: address,name,size,is_named,subsystem
+            size_t c1 = line.find(',');   // after address
+            size_t c2 = line.find(',', c1 + 1);  // after name
+            size_t c3 = line.find(',', c2 + 1);  // after size
+            if (c1 == std::string::npos || c3 == std::string::npos) continue;
+            try {
+                std::string addr_str = line.substr(0, c1);
+                std::string size_str = line.substr(c2 + 1, c3 - c2 - 1);
+                if (addr_str.size() > 2 && addr_str[0] == '0' && (addr_str[1] == 'x' || addr_str[1] == 'X'))
+                    addr_str = addr_str.substr(2);
+                uint64_t addr = std::stoull(addr_str, nullptr, 16);
+                uint64_t size = std::stoull(size_str, nullptr, 10);
                 functions[addr] = {addr, addr + size};
-            }
-            sqlite3_finalize(stmt);
+            } catch (...) { continue; }
         }
-        sqlite3_close(db);
+        std::cout << "  " << functions.size() << " functions from CSV\n";
     }
-    std::cout << "  " << functions.size() << " functions to match\n";
+    std::cout << "  " << functions.size() << " functions from CSV\n";
 
-    // Match
-    std::cout << "Matching against ELF: " << elf_path << "\n";
-    auto matches = match_sce_functions(elf_path, functions, sce_db);
-    std::cout << "  " << matches.size() << " matches found\n";
+    std::map<uint64_t, SceMatch> all_matches;
+
+    // Strategy 1: SHA-1 matching
+    if (!sce_path.empty()) {
+        std::cout << "Loading SCE database: " << sce_path << "\n";
+        auto sce_db = load_sce_database(sce_path);
+        auto sha1_matches = match_sce_functions(elf_path, functions, sce_db);
+        std::cout << "  SHA-1 matches: " << sha1_matches.size() << "\n";
+        for (auto& [a, m] : sha1_matches) all_matches[a] = m;
+    }
+
+    // Strategy 2: SDK address lookup from config.toml
+    if (!config_path.empty()) {
+        std::cout << "Loading SDK addresses: " << config_path << "\n";
+        auto sdk_addrs = load_sdk_addresses(config_path);
+        std::cout << "  " << sdk_addrs.size() << " SDK addresses loaded\n";
+        auto addr_matches = match_sdk_addresses(sdk_addrs, functions);
+        std::cout << "  Address matches: " << addr_matches.size() << "\n";
+        for (auto& [a, m] : addr_matches) all_matches[a] = m;
+    }
+
+    std::cout << "\nTotal SDK matches: " << all_matches.size() << "\n";
 
     // Show some matches
     int shown = 0;
-    for (auto& [addr, m] : matches) {
-        if (shown++ >= 10) break;
+    for (auto& [addr, m] : all_matches) {
+        if (shown++ >= 15) break;
         char hex[32];
         snprintf(hex, sizeof(hex), "0x%08X", (uint32_t)addr);
-        std::cout << "  " << hex << " -> " << m.library << "." << m.name << "\n";
+        std::cout << "  " << hex << " -> " << m.library << "." << m.name << " (" << m.size << "B)\n";
     }
-    if (matches.size() > 10)
-        std::cout << "  ... and " << (matches.size() - 10) << " more\n";
+    if (all_matches.size() > 15)
+        std::cout << "  ... and " << (all_matches.size() - 15) << " more\n";
 
-    // Update DB
-    std::cout << "Updating database...\n";
-    update_db_sdk_categories(analysis_db, matches);
-    std::cout << "Done.\n";
+    // Export updated CSV
+    std::cout << "\nExporting SDK CSV...\n";
+    export_sdk_csv(csv_path, all_matches);
 
     return 0;
 }
