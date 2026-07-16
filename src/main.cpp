@@ -142,7 +142,7 @@ static int cmd_analyze(int argc, char** argv) {
     std::string proj = output + "/ghidra_project";
     fs::create_directories(proj);
     std::string cmd = ghidra.analyze_headless + " \"" + proj + "\" ps2_analysis"
-        + " -import \"" + input + "\" -processor EmotionEngine:LE:32:default"
+        + " -import \"" + input + "\""
         + " -analysisTimeoutPerFile 600 -deleteProject 2>&1";
     std::cout << "PS2 Ghidra Analysis: " << input << " -> " << output << "\n";
     return system(cmd.c_str());
