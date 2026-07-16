@@ -47,10 +47,84 @@ static int cmd_ghidra_setup(int argc, char** argv) {
     std::cout << "Detecting Ghidra...\n";
     auto ghidra = find_ghidra();
     if (!ghidra.found) {
-        std::cout << "\nGhidra NOT FOUND\n\nInstall: https://ghidra-sre.org/\n";
-        return 1;
+        std::cout << "\nGhidra NOT FOUND\n";
+        std::cout << "Searched: $GHIDRA_HOME, /opt/*, ~/ghidra*, /mnt/Datos/Herramientas/*\n\n";
+        std::cout << "Enter Ghidra path (or press Enter to skip): ";
+        std::string user_path;
+        std::getline(std::cin, user_path);
+
+        // Trim whitespace
+        while (!user_path.empty() && (user_path.back() == '\n' || user_path.back() == '\r'))
+            user_path.pop_back();
+
+        if (user_path.empty()) {
+            std::cout << "Install from: https://ghidra-sre.org/\n";
+            std::cout << "Then: export GHIDRA_HOME=/path/to/ghidra\n";
+            return 1;
+        }
+
+        // Validate the path
+        if (!fs::is_directory(user_path)) {
+            std::cerr << "ERROR: Directory not found: " << user_path << "\n";
+            return 1;
+        }
+
+        std::string headless = "";
+        // Check if user_path itself contains analyzeHeadless
+        auto hl = fs::path(user_path) / "support" / "analyzeHeadless";
+        if (fs::exists(hl)) {
+            headless = hl.string();
+        } else {
+            // Search for ghidra_* subdirectories inside user_path
+            for (auto& p : fs::directory_iterator(user_path)) {
+                std::string name = p.path().filename().string();
+                if (name.find("ghidra") != std::string::npos && p.is_directory()) {
+                    auto sub_hl = p.path() / "support" / "analyzeHeadless";
+                    if (fs::exists(sub_hl)) {
+                        headless = sub_hl.string();
+                        // Update path to the ghidra_* subdir
+                        user_path = p.path().string();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (headless.empty()) {
+            std::cerr << "ERROR: analyzeHeadless not found in " << user_path << "\n";
+            std::cerr << "Make sure this is a valid Ghidra installation.\n";
+            return 1;
+        }
+
+        // Manually populate GhidraInfo
+        ghidra.found = true;
+        ghidra.path = user_path;
+        ghidra.analyze_headless = headless;
+        // Extract version
+        for (auto& p : fs::directory_iterator(user_path)) {
+            std::string name = p.path().filename().string();
+            if (name.find("ghidra_") == 0 && p.is_directory()) {
+                auto ver = p.path().filename().string();
+                auto pos = ver.find("ghidra_");
+                if (pos != std::string::npos) {
+                    std::string v = ver.substr(pos + 7);
+                    auto end = v.find("_PUBLIC");
+                    if (end != std::string::npos) v = v.substr(0, end);
+                    ghidra.version = v;
+                }
+                break;
+            }
+        }
+        if (ghidra.version.empty()) ghidra.version = "unknown";
+
+        // Check Java
+        ghidra.has_java = !exec_cmd("which java 2>/dev/null").empty();
+
+        std::cout << "\nUsing Ghidra " << ghidra.version << " at " << ghidra.path << "\n";
+    } else {
+        std::cout << "Found Ghidra " << ghidra.version << " at " << ghidra.path << "\n";
     }
-    std::cout << "Found Ghidra " << ghidra.version << " at " << ghidra.path << "\n";
+
     std::cout << "Java: " << (ghidra.has_java ? "OK" : "NOT FOUND") << "\n";
     if (!ghidra.has_java) { std::cerr << "ERROR: Java not found\n"; return 1; }
     std::cout << "\nChecking plugins...\n";

@@ -20,24 +20,48 @@ const PluginInfo PLUGIN_EMOTIONENGINE = {
 };
 
 static std::string get_extensions_dir(const GhidraInfo& ghidra) {
+    // Check if path itself has Extensions/Ghidra
+    auto direct = fs::path(ghidra.path) / "Extensions" / "Ghidra";
+    if (fs::is_directory(direct)) return direct.string();
+
+    // Check ghidra_* subdirectories
     for (auto& p : fs::directory_iterator(ghidra.path)) {
         std::string name = p.path().filename().string();
-        if (name.find("ghidra_") == 0 && p.is_directory()) {
-            return (p.path() / "Extensions" / "Ghidra").string();
+        if (name.find("ghidra") != std::string::npos && p.is_directory()) {
+            auto ext = p.path() / "Extensions" / "Ghidra";
+            if (fs::is_directory(ext)) return ext.string();
         }
     }
+
+    // Check parent directory (user might have pointed to Ghidra/support)
+    auto parent = fs::path(ghidra.path).parent_path();
+    auto parent_ext = parent / "Extensions" / "Ghidra";
+    if (fs::is_directory(parent_ext)) return parent_ext.string();
+
+    // Check Ghidra/ subdirectory (common layout: Ghidra/Ghidra/Extensions/Ghidra)
+    auto ghidra_sub = fs::path(ghidra.path) / "Ghidra" / "Extensions" / "Ghidra";
+    if (fs::is_directory(ghidra_sub)) return ghidra_sub.string();
+
     return "";
 }
 
 static bool dir_contains_extension(const std::string& ext_dir, const std::string& plugin_name) {
     if (!fs::is_directory(ext_dir)) return false;
+
+    // Normalize plugin name: lowercase, replace spaces with hyphens
+    std::string normalized_plugin = plugin_name;
+    std::transform(normalized_plugin.begin(), normalized_plugin.end(), normalized_plugin.begin(), ::tolower);
+    std::replace(normalized_plugin.begin(), normalized_plugin.end(), ' ', '-');
+
     for (auto& p : fs::directory_iterator(ext_dir)) {
         std::string name = p.path().filename().string();
         std::string lower_name = name;
-        std::string lower_plugin = plugin_name;
         std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-        std::transform(lower_plugin.begin(), lower_plugin.end(), lower_plugin.begin(), ::tolower);
-        if (lower_name.find(lower_plugin) != std::string::npos) {
+
+        // Check if directory name contains the normalized plugin name
+        if (lower_name.find(normalized_plugin) != std::string::npos ||
+            lower_name.find("emotionengine") != std::string::npos ||
+            lower_name.find("emotion-engine") != std::string::npos) {
             if (p.is_directory()) return true;
             for (auto& sub : fs::directory_iterator(p.path())) {
                 if (sub.is_directory()) return true;

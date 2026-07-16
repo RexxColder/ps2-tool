@@ -9,7 +9,7 @@
 
 namespace fs = std::filesystem;
 
-static std::string exec_cmd(const std::string& cmd) {
+std::string exec_cmd(const std::string& cmd) {
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) return "";
     char buf[256];
@@ -23,27 +23,41 @@ static std::string exec_cmd(const std::string& cmd) {
 }
 
 static std::string extract_version(const std::string& path) {
-    // Try to read version from Ghidra's application.properties
-    for (auto& p : fs::directory_iterator(path)) {
-        if (p.path().filename().string().find("ghidra_") == 0 && p.is_directory()) {
-            auto props = p.path() / "application.properties";
-            if (fs::exists(props)) {
-                std::ifstream f(props);
-                std::string line;
-                while (std::getline(f, line)) {
-                    if (line.find("application.version") != std::string::npos) {
-                        auto eq = line.find('=');
-                        if (eq != std::string::npos) {
-                            std::string v = line.substr(eq + 1);
-                            // trim whitespace
-                            while (!v.empty() && v.front() == ' ') v.erase(0, 1);
-                            while (!v.empty() && v.back() == ' ') v.pop_back();
-                            return v;
-                        }
-                    }
+    // Try application.properties in various locations
+    std::vector<fs::path> prop_paths = {
+        fs::path(path) / "application.properties",
+        fs::path(path) / "Ghidra" / "application.properties",
+    };
+
+    // Also check ghidra_* subdirectories
+    if (fs::is_directory(path)) {
+        for (auto& p : fs::directory_iterator(path)) {
+            if (p.path().filename().string().find("ghidra") != std::string::npos && p.is_directory()) {
+                prop_paths.push_back(p.path() / "application.properties");
+            }
+        }
+    }
+
+    for (auto& props : prop_paths) {
+        if (!fs::exists(props)) continue;
+        std::ifstream f(props);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.find("application.version") != std::string::npos) {
+                auto eq = line.find('=');
+                if (eq != std::string::npos) {
+                    std::string v = line.substr(eq + 1);
+                    while (!v.empty() && v.front() == ' ') v.erase(0, 1);
+                    while (!v.empty() && v.back() == ' ') v.pop_back();
+                    return v;
                 }
             }
-            // Fallback: extract from dirname
+        }
+    }
+
+    // Fallback: extract from dirname
+    if (fs::is_directory(path)) {
+        for (auto& p : fs::directory_iterator(path)) {
             std::string dname = p.path().filename().string();
             auto pos = dname.find("ghidra_");
             if (pos != std::string::npos) {
@@ -54,19 +68,32 @@ static std::string extract_version(const std::string& path) {
             }
         }
     }
+
     return "unknown";
 }
 
 static std::string find_headless(const std::string& ghidra_path) {
+    // Check if ghidra_path itself has support/analyzeHeadless
+    auto direct = fs::path(ghidra_path) / "support" / "analyzeHeadless";
+    if (fs::exists(direct)) return direct.string();
+
+    // Check ghidra_* subdirectories
     for (auto& p : fs::directory_iterator(ghidra_path)) {
-        if (p.path().filename().string().find("ghidra_") == 0 && p.is_directory()) {
+        if (p.path().filename().string().find("ghidra") != std::string::npos && p.is_directory()) {
             auto headless = p.path() / "support" / "analyzeHeadless";
             if (fs::exists(headless)) return headless.string();
-            // Try .bat for cross-platform
-            auto headless_bat = p.path() / "support" / "analyzeHeadless.bat";
-            if (fs::exists(headless_bat)) return headless_bat.string();
         }
     }
+
+    // Check parent (user might have pointed to Ghidra/support)
+    auto parent = fs::path(ghidra_path).parent_path();
+    auto parent_hl = parent / "support" / "analyzeHeadless";
+    if (fs::exists(parent_hl)) return parent_hl.string();
+
+    // Check Ghidra/ subdirectory
+    auto ghidra_sub = fs::path(ghidra_path) / "Ghidra" / "support" / "analyzeHeadless";
+    if (fs::exists(ghidra_sub)) return ghidra_sub.string();
+
     return "";
 }
 
@@ -91,6 +118,18 @@ GhidraInfo find_ghidra() {
     search_paths.push_back(std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/ghidra");
     search_paths.push_back("/usr/local/ghidra");
     search_paths.push_back(std::string(std::getenv("HOME") ? std::getenv("HOME") : "") + "/.local/share/ghidra");
+    search_paths.push_back("/mnt/Datos/Herramientas");
+    search_paths.push_back("/mnt/Datos/Herramientas/Ghidra");
+
+    // 3. Search /mnt/Datos/Herramientas for ghidra_* subdirectories
+    if (fs::is_directory("/mnt/Datos/Herramientas")) {
+        for (auto& p : fs::directory_iterator("/mnt/Datos/Herramientas")) {
+            std::string name = p.path().filename().string();
+            if (name.find("ghidra") != std::string::npos && p.is_directory()) {
+                search_paths.push_back(p.path().string());
+            }
+        }
+    }
 
     // 3. Search /opt for ghidra_* directories
     if (fs::is_directory("/opt")) {

@@ -10,3 +10,4 @@ struct GhidraInfo {
 };
 
 GhidraInfo find_ghidra();
+std::string exec_cmd(const std::string& cmd);
