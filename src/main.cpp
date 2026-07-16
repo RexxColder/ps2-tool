@@ -1,8 +1,11 @@
+#include <unistd.h>
+#include "sqlite3.h"
 // ps2-tool - PS2 Reverse Engineering CLI
 #include "elf_parser.h"
 #include "ghidra_detect.h"
 #include "ghidra_plugins.h"
 #include "export_ps2recomp.h"
+#include "sce_match.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -19,12 +22,17 @@ static void usage() {
               << "Commands:\n"
               << "  info          <game.elf>                 Show ELF metadata\n"
               << "  analyze       <game.elf> <out>            Ghidra headless analysis\n"
+              << "  match-sce     <game.elf> <db> <out_db>    Match SDK functions via SHA-1\n"
               << "  export        --db <db> --elf <name>      PS2Recomp TOML/CSV\n"
               << "  ghidra-setup                              Detect Ghidra + install EE plugin\n";
 }
 
-static std::string getArg(int argc, char** argv, int idx, const std::string& def = "") {
-    return (idx < argc) ? argv[idx] : def;
+static std::string get_script_dir() {
+    char exe_path[4096];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len <= 0) return ".";
+    exe_path[len] = '\0';
+    return fs::path(exe_path).parent_path().string();
 }
 
 static int cmd_info(int argc, char** argv) {
@@ -39,9 +47,7 @@ static int cmd_ghidra_setup(int argc, char** argv) {
     std::cout << "Detecting Ghidra...\n";
     auto ghidra = find_ghidra();
     if (!ghidra.found) {
-        std::cout << "\nGhidra NOT FOUND\n\n";
-        std::cout << "Install from: https://ghidra-sre.org/\n";
-        std::cout << "Then: export GHIDRA_HOME=/path/to/ghidra\n";
+        std::cout << "\nGhidra NOT FOUND\n\nInstall: https://ghidra-sre.org/\n";
         return 1;
     }
     std::cout << "Found Ghidra " << ghidra.version << " at " << ghidra.path << "\n";
@@ -55,38 +61,77 @@ static int cmd_ghidra_setup(int argc, char** argv) {
 
 static int cmd_analyze(int argc, char** argv) {
     if (argc < 4) { std::cerr << "Usage: ps2-tool analyze <game.elf> <out>\n"; return 1; }
-
     auto ghidra = find_ghidra();
     if (!ghidra.found) { std::cerr << "Ghidra not found. Run: ps2-tool ghidra-setup\n"; return 1; }
-
     std::string input = argv[2], output = argv[3];
     fs::create_directories(output);
-
     std::string proj = output + "/ghidra_project";
     fs::create_directories(proj);
-
-    // Emotion Engine processor for PS2
-    std::string spec = "EmotionEngine:LE:32:default";
-
     std::string cmd = ghidra.analyze_headless + " \"" + proj + "\" ps2_analysis"
-        + " -import \"" + input + "\""
-        + " -processor " + spec
-        + " -analysisTimeoutPerFile 600"
-        + " -deleteProject"
-        + " 2>&1";
+        + " -import \"" + input + "\" -processor EmotionEngine:LE:32:default"
+        + " -analysisTimeoutPerFile 600 -deleteProject 2>&1";
+    std::cout << "PS2 Ghidra Analysis: " << input << " -> " << output << "\n";
+    return system(cmd.c_str());
+}
 
-    std::cout << "PS2 Ghidra Analysis\n"
-              << "  Processor: " << spec << "\n"
-              << "  Input: " << input << "\n"
-              << "  Output: " << output << "\n\n";
-
-    int ret = system(cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "Analysis failed (exit " << ret << ")\n";
-        return ret;
+static int cmd_match_sce(int argc, char** argv) {
+    if (argc < 5) {
+        std::cerr << "Usage: ps2-tool match-sce <game.elf> <sce_db.json> <analysis.db>\n";
+        std::cerr << "  Reads ELF + analysis DB, matches functions against SCE database,\n";
+        std::cerr << "  updates DB with SDK categories and library names.\n";
+        return 1;
     }
+    std::string elf_path = argv[2];
+    std::string sce_db_path = argv[3];
+    std::string analysis_db = argv[4];
 
-    std::cout << "\nAnalysis complete: " << output << "\n";
+    std::cout << "Loading SCE database: " << sce_db_path << "\n";
+    auto sce_db = load_sce_database(sce_db_path);
+    std::cout << "  " << sce_db.size() << " SHA-1 signatures loaded\n";
+
+    // Read functions from analysis DB
+    std::map<uint64_t, std::pair<uint64_t, uint64_t>> functions;
+    {
+        sqlite3* db = nullptr;
+        if (sqlite3_open(analysis_db.c_str(), &db) != SQLITE_OK) {
+            std::cerr << "Cannot open DB: " << analysis_db << "\n";
+            return 1;
+        }
+        sqlite3_stmt* stmt = nullptr;
+        std::string q = "SELECT address, size FROM functions ORDER BY address";
+        if (sqlite3_prepare_v2(db, q.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                uint64_t addr = sqlite3_column_int64(stmt, 0);
+                uint64_t size = sqlite3_column_int64(stmt, 1);
+                functions[addr] = {addr, addr + size};
+            }
+            sqlite3_finalize(stmt);
+        }
+        sqlite3_close(db);
+    }
+    std::cout << "  " << functions.size() << " functions to match\n";
+
+    // Match
+    std::cout << "Matching against ELF: " << elf_path << "\n";
+    auto matches = match_sce_functions(elf_path, functions, sce_db);
+    std::cout << "  " << matches.size() << " matches found\n";
+
+    // Show some matches
+    int shown = 0;
+    for (auto& [addr, m] : matches) {
+        if (shown++ >= 10) break;
+        char hex[32];
+        snprintf(hex, sizeof(hex), "0x%08X", (uint32_t)addr);
+        std::cout << "  " << hex << " -> " << m.library << "." << m.name << "\n";
+    }
+    if (matches.size() > 10)
+        std::cout << "  ... and " << (matches.size() - 10) << " more\n";
+
+    // Update DB
+    std::cout << "Updating database...\n";
+    update_db_sdk_categories(analysis_db, matches);
+    std::cout << "Done.\n";
+
     return 0;
 }
 
@@ -101,8 +146,10 @@ static int cmd_export(int argc, char** argv) {
         std::cerr << "Usage: ps2-tool export --db <db> --elf-name <name>\n";
         return 1;
     }
-    std::ofstream tf("ps2recomp_config.toml"); tf << export_ps2recomp_toml(db, elf);
-    std::ofstream cf("functions.csv"); cf << export_ps2recomp_csv(db, elf);
+    std::string toml = export_ps2recomp_toml(db, elf);
+    std::string csv = export_ps2recomp_csv(db, elf);
+    std::ofstream tf("ps2recomp_config.toml"); tf << toml;
+    std::ofstream cf("functions.csv"); cf << csv;
     std::cout << "TOML: ps2recomp_config.toml\nCSV:  functions.csv\n";
     return 0;
 }
@@ -113,6 +160,7 @@ int main(int argc, char** argv) {
     if (cmd == "info")          return cmd_info(argc, argv);
     if (cmd == "ghidra-setup")  return cmd_ghidra_setup(argc, argv);
     if (cmd == "analyze")       return cmd_analyze(argc, argv);
+    if (cmd == "match-sce")     return cmd_match_sce(argc, argv);
     if (cmd == "export")        return cmd_export(argc, argv);
     usage(); return 1;
 }
