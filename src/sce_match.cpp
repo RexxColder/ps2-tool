@@ -3,6 +3,7 @@
 #include "sqlite3.h"
 #include <fstream>
 #include <iostream>
+#include <algorithm>
 #include <sstream>
 
 // Load SDK function names from Ghidra output (functions.csv)
@@ -52,7 +53,7 @@ std::map<uint64_t, std::string> load_sdk_addresses(const std::string& config_pat
     return addrs;
 }
 
-// Match functions: SHA-1 exact + name pattern + SDK address lookup
+// Match functions: SHA-1 + name + size + stub pattern
 std::map<uint64_t, SceMatch> match_sce_functions(
     const std::string& elf_path,
     const std::map<uint64_t, std::pair<uint64_t, uint64_t>>& functions,
@@ -65,11 +66,19 @@ std::map<uint64_t, SceMatch> match_sce_functions(
     std::vector<uint8_t> elf(fsz);
     f.read(reinterpret_cast<char*>(elf.data()), fsz);
 
+    // Build name index for fast lookup
+    std::map<std::string, SceDbEntry> name_index;
+    for (auto& [sha, entry] : sce_db) {
+        std::string lower = entry.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        name_index[lower] = entry;
+    }
+
     for (auto& [addr, b] : functions) {
         uint64_t sz = b.second - b.first;
         if (sz < 4 || sz > 2048 || b.first + sz > fsz) continue;
 
-        // Try SHA-1 exact match
+        // Strategy 1: SHA-1 exact match
         std::string h = SHA1::hash_hex(elf.data() + b.first, sz);
         auto it = sce_db.find(h);
         if (it != sce_db.end()) {
@@ -77,7 +86,11 @@ std::map<uint64_t, SceMatch> match_sce_functions(
             continue;
         }
 
-        // Pattern: first instruction is jr r31 (function return stub)
+        // Strategy 2: Name match against SCE database
+        // (for functions Ghidra already named)
+        // This is handled in match_sdk_addresses
+
+        // Strategy 3: Instruction pattern (stub detection)
         uint32_t first_word = (uint32_t(elf[b.first]) << 24) | (uint32_t(elf[b.first+1]) << 16) |
                               (uint32_t(elf[b.first+2]) << 8) | elf[b.first+3];
         bool is_stub = ((first_word & 0xFC1FFFFF) == 0x03E00008) || // jr r31
@@ -105,22 +118,90 @@ std::map<uint64_t, SceMatch> match_sdk_addresses(
     for (auto& [addr, name] : sdk_addrs) {
         if (functions.count(addr)) {
             auto& [start, end] = functions.at(addr);
-            // Determine library from name prefix
             std::string lib = "unknown";
             if (name.find("sce") == 0 || name.find("Sif") == 0 || name.find("Gs") == 0) lib = "libps2sdk";
-            else if (name.find("Pad") == 0) lib = "libpad";
+            else if (name.find("Pad") == 0 || name.find("pad") == 0) lib = "libpad";
             else if (name.find("Mc") == 0) lib = "libmc";
             else if (name.find("Cd") == 0 || name.find("sceCd") == 0) lib = "libcdvd";
-            else if (name.find("Dma") == 0) lib = "libdma";
-            else if (name.find("Vif") == 0) lib = "libvif";
-            else if (name.find("Gif") == 0) lib = "libgif";
-            else if (name.find("Mpeg") == 0) lib = "libmpeg";
-            else if (name.find("Spu") == 0) lib = "libspu";
+            else if (name.find("Dma") == 0 || name.find("dma") == 0) lib = "libdma";
+            else if (name.find("Vif") == 0 || name.find("vif") == 0) lib = "libvif";
+            else if (name.find("Gif") == 0 || name.find("gif") == 0) lib = "libgif";
+            else if (name.find("Mpeg") == 0 || name.find("mpeg") == 0) lib = "libmpeg";
+            else if (name.find("Spu") == 0 || name.find("spu") == 0) lib = "libspu";
             else if (name.find("Iop") == 0) lib = "libiop";
-            else if (name.find("Vpu") == 0) lib = "libvpu";
-
+            else if (name.find("Vpu") == 0 || name.find("vu") == 0) lib = "libvpu";
+            else if (name.find("SSL") == 0 || name.find("ssl") == 0) lib = "libssl";
+            else if (name.find("BIO") == 0) lib = "libbio";
+            else if (name.find("EVP") == 0) lib = "libcrypto";
+            else if (name.find("Timer") == 0 || name.find("timer") == 0) lib = "libtimer";
+            else if (name.find("Thread") == 0 || name.find("Sema") == 0 || name.find("Event") == 0) lib = "libthread";
+            else if (name.find("malloc") == 0 || name.find("free") == 0 || name.find("calloc") == 0 || name.find("realloc") == 0) lib = "libmalloc";
+            else if (name.find("printf") == 0 || name.find("sprintf") == 0 || name.find("snprintf") == 0 || name.find("fprintf") == 0) lib = "libstdio";
+            else if (name.find("str") == 0 || name.find("mem") == 0) lib = "libc";
             matches[addr] = {lib, name, (int)(end - start)};
         }
+    }
+    return matches;
+}
+
+// Match Ghidra function names against SCE database
+std::map<uint64_t, SceMatch> match_ghidra_names(
+    const std::map<uint64_t, std::pair<uint64_t, uint64_t>>& functions,
+    const std::map<std::string, SceDbEntry>& sce_db,
+    const std::string& csv_path) {
+
+    std::map<uint64_t, SceMatch> matches;
+
+    // Build name -> SCE entry index
+    std::map<std::string, SceDbEntry> name_index;
+    for (auto& [sha, entry] : sce_db) {
+        std::string lower = entry.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        name_index[lower] = entry;
+    }
+
+    // Read Ghidra CSV
+    std::ifstream csv(csv_path);
+    if (!csv) return matches;
+    std::string header;
+    std::getline(csv, header);
+    std::string line;
+    while (std::getline(csv, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t c1 = line.find(',');
+        size_t c2 = line.find(',', c1 + 1);
+        size_t c3 = line.find(',', c2 + 1);
+        if (c1 == std::string::npos || c3 == std::string::npos) continue;
+        try {
+            std::string addr_str = line.substr(0, c1);
+            std::string name = line.substr(c1 + 1, c2 - c1 - 1);
+            std::string size_str = line.substr(c2 + 1, c3 - c2 - 1);
+            if (addr_str.size() > 2 && addr_str[0] == '0' && addr_str[1] == 'x')
+                addr_str = addr_str.substr(2);
+            uint64_t addr = std::stoull(addr_str, nullptr, 16);
+            int size = std::stoi(size_str);
+
+            // Try exact name match
+            std::string lower_name = name;
+            std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+
+            // Check if name matches SCE database
+            auto it = name_index.find(lower_name);
+            if (it != name_index.end()) {
+                matches[addr] = {it->second.library, it->second.name, it->second.size};
+                continue;
+            }
+
+            // Check if name contains known SDK patterns
+            if (lower_name.find("sce") == 0 || lower_name.find("pad") == 0 ||
+                lower_name.find("cd") == 0 || lower_name.find("dma") == 0 ||
+                lower_name.find("vif") == 0 || lower_name.find("gif") == 0 ||
+                lower_name.find("mpeg") == 0 || lower_name.find("spu") == 0 ||
+                lower_name.find("vu") == 0 || lower_name.find("iop") == 0) {
+                // This looks like an SDK function
+                matches[addr] = {"libps2sdk", name, size};
+            }
+        } catch (...) { continue; }
     }
     return matches;
 }

@@ -30,3 +30,8 @@ std::map<uint64_t, SceMatch> match_sdk_addresses(
 
 void update_db_sdk_categories(const std::string& db_path, const std::map<uint64_t, SceMatch>& matches);
 void export_sdk_csv(const std::string& csv_path, const std::map<uint64_t, SceMatch>& matches);
+
+std::map<uint64_t, SceMatch> match_ghidra_names(
+    const std::map<uint64_t, std::pair<uint64_t, uint64_t>>& functions,
+    const std::map<std::string, SceDbEntry>& sce_db,
+    const std::string& csv_path);

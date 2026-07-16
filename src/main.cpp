@@ -216,6 +216,18 @@ static int cmd_match_sce(int argc, char** argv) {
         for (auto& [a, m] : addr_matches) all_matches[a] = m;
     }
 
+    // Strategy 3: Ghidra name matching against SCE database
+    if (!sce_path.empty()) {
+        auto sce_db = load_sce_database(sce_path);
+        auto name_matches = match_ghidra_names(functions, sce_db, csv_path);
+        std::cout << "  Name matches: " << name_matches.size() << "\n";
+        for (auto& [a, m] : name_matches) {
+            if (all_matches.find(a) == all_matches.end()) {
+                all_matches[a] = m;
+            }
+        }
+    }
+
     std::cout << "\nTotal SDK matches: " << all_matches.size() << "\n";
 
     // Show some matches
