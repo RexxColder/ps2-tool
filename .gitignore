@@ -1,3 +1,5 @@
 *.o
 *.d
 ps2-tool
+functions.csv
+strings.csv
