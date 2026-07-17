@@ -144,7 +144,7 @@ static int cmd_analyze(int argc, char** argv) {
     std::string cmd = ghidra.analyze_headless + " \"" + proj + "\" ps2_analysis"
         + " -import \"" + input + "\""
         + " -scriptPath " + get_script_dir() + "/ghidra_scripts"
-        + " -postScript ExportFunctions.java " + output
+        + " -postScript AnalyzeAndExport.java " + output
         + " -analysisTimeoutPerFile 600 -deleteProject 2>&1";
     std::cout << "PS2 Ghidra Analysis: " << input << " -> " << output << "\n";
     return system(cmd.c_str());
